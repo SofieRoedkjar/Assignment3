@@ -37,15 +37,221 @@ We first want to build a logistic regression to see whether you can diagnose sch
 Then cross-validate the logistic regression and re-calculate performance on the testing folds. N.B. The cross-validation functions you already have should be tweaked: you need to calculate these new performance measures. Alternatively, the groupdata2 and cvms package created by Ludvig are an easy solution. 
 
 N.B. the predict() function generates log odds (the full scale between minus and plus infinity). Log odds > 0 indicates a choice of 1, below a choice of 0.
-N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one datase, so to calculate overall performance.
+N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one dataset, so to calculate overall performance.
 N.N.N.B. Now you have two levels of structure: subject and study. Should this impact your cross-validation?
 N.N.N.N.B. A more advanced solution could rely on the tidymodels set of packages (warning: Time-consuming to learn as the documentation is sparse, but totally worth it)
 
 
 
 ```{r}
+library(pacman)
+pacman::p_load(tidyverse, purrr, lme4, lmerTest, DescTools, sjstats, tidymodels, groupdata2)
 
+#load data
+danishdata <- read.csv("danish_data.csv")
+
+
+### PREPROCESS DATA ###
+set.seed(5)
+
+
+danishdata$Diagnosis <- as.factor(danishdata$Diagnosis)
+levels(danishdata$Diagnosis)
+
+
+#partition the data
+df_list <- partition(danishdata, p = 0.2, cat_col = c("Diagnosis"), id_col = NULL, list_out = T) #p=0.2 takes 20% out to be the test set
+df_test = df_list[[1]]
+df_train = df_list[[2]]
+
+#make variables factors
+df_train$Diagnosis <- as.factor(df_train$Diagnosis)
+df_train$Study <- as.factor(df_train$Study)
+df_train$uID <- as.factor(df_train$uID)
+df_train$Trial <- as.factor(df_train$Trial)
+
+df_test$Diagnosis <- as.factor(df_test$Diagnosis)
+df_test$Study <- as.factor(df_test$Study)
+df_test$uID <- as.factor(df_test$uID)
+df_test$Trial <- as.factor(df_test$Trial)
+levels(df_test$Diagnosis)
+
+### WITH 1 PREDICTOR ###
+#recipe to preprocess the data (center and scale)
+rec <- df_train %>% recipe(Diagnosis ~ .) %>% # defines the outcome
+  step_center(all_numeric()) %>% # center numeric predictors
+  step_scale(all_numeric()) %>% # scales numeric predictors
+  step_corr(all_numeric()) %>% 
+  #check_missing(everything()) %>%
+  prep(training = df_train) #executing transformations on the data in the brackets (usually training data)
+
+train_baked <- juice(rec) # extract df_train (finalized training set) from recipe
+rec #inspect rec
+ 
+test_baked <- rec %>% bake(df_test) #applying recipe to test data
+
+#make Diagnosis a factor
+train_baked$Diagnosis <- as.factor(train_baked$Diagnosis)
+test_baked$Diagnosis <- as.factor(test_baked$Diagnosis)
+
+#fit the model with the best predictor
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~ speechrate, data = train_baked)
+ 
+#get both of it at once (just additional), get it all in a table
+test_results <- 
+ test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1)
+  )
+ 
+#examine the first 5 results 
+test_results %>% 
+  head(5) %>% 
+  knitr::kable() 
+ 
+#PERFORMANCE METRICS
+#get accuracy and kappa
+metrics(test_results, truth = Diagnosis, estimate = log_class) %>% 
+  knitr::kable()
+#accuracy: percent of agreement 
+#kappa: agreement, corrected for just "by change"
+ 
+#roc curve
+test_results %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+#best model if it would go straight up and then to the right, the dottet line is the worst 
+ 
+#gain curve
+test_results %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+#bottom of grey: just chance, top of grey: if it caputred everything in the data, line: where our model actually is 
+
+
+### USE CVMS FROM TORTURIAL ###
+# Attach packages
+pacman::p_load(cvms, tidymodels, randomForest)
+
+# Prepare data
+dat <- groupdata2::fold(train_baked, k = 10,
+                                     cat_col = 'Diagnosis',
+                                     id_col = 'uID')
+dat[["Diagnosis"]] <- factor(dat[["Diagnosis"]])
+
+
+##Create model function (log_reg) that takes train_data and fits a model object
+log_model_fn <- function(train_data, formula){
+    logistic_reg() %>%  
+    set_mode(mode = "classification") %>% 
+    set_engine("glm") %>%
+    fit(formula, data = train_data)
+  }
+
+
+# Create a model function (random forest in this case)
+# that takes train_data and formula as arguments
+# and returns the fitted model object
+rf_model_fn <- function(train_data, formula){
+    rand_forest(trees = 100, mode = "classification") %>%
+      set_engine("randomForest") %>%
+      fit(formula, data = train_data)
+  }
+
+
+# Create a predict function
+# Usually just wraps stats::predict
+# Takes test_data, model and formula arguments
+# and returns vector with probabilities of class 1
+# (this depends on the type of task, gaussian, binomial or multinomial)
+rf_predict_fn <- function(test_data, model, formula){
+    stats::predict(object = model, new_data = test_data, type = "prob")[[2]]
+  }
+
+# Now cross-validation
+# Note the different argument names from cross_validate()
+CV_log <- cross_validate_fn(
+  dat,
+  model_fn = log_model_fn,
+  formulas = c("Diagnosis ~ speechrate", "Diagnosis ~ IQR", "Diagnosis ~ proportionSpoken", "Diagnosis ~ pauseDuration", "Diagnosis ~ speechrate + IQR", "Diagnosis ~ speechrate + proportionSpoken", "Diagnosis ~ speechrate + pauseDuration", "Diagnosis ~ IQR + proportionSpoken", "Diagnosis ~ IQR + pauseDuration", "Diagnosis ~ proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + IQR + proportionSpoken", "Diagnosis ~ speechrate + IQR + pauseDuration", "Diagnosis ~ IQR + proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + IQR + proportionSpoken + pauseDuration"),
+  fold_cols = '.folds',
+  type = 'binomial',
+  predict_fn = rf_predict_fn
+)
+#cross validate random forest
+CV_rf <- cross_validate_fn(
+  dat,
+  model_fn = rf_model_fn,
+  formulas = c("Diagnosis ~ speechrate", "Diagnosis ~ IQR", "Diagnosis ~ proportionSpoken", "Diagnosis ~ pauseDuration", "Diagnosis ~ speechrate + IQR", "Diagnosis ~ speechrate + proportionSpoken", "Diagnosis ~ speechrate + pauseDuration", "Diagnosis ~ IQR + proportionSpoken", "Diagnosis ~ IQR + pauseDuration", "Diagnosis ~ proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + IQR + proportionSpoken", "Diagnosis ~ speechrate + IQR + pauseDuration", "Diagnosis ~ IQR + proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + proportionSpoken + pauseDuration", "Diagnosis ~ speechrate + IQR + proportionSpoken + pauseDuration"),
+  fold_cols = '.folds',
+  type = 'binomial',
+  predict_fn = rf_predict_fn
+)
+
+#inspect data
+CV_log %>% 
+  select(1:6) %>% #select only the first 6 cols
+  head(15) %>% #select only the first two rows
+  knitr::kable()
+#inspect random forest
+CV_rf %>% 
+  select(1:6) %>% #select only the first 6 cols
+  head(15) %>% #select only the first two rows
+  knitr::kable()
+
+### TEST BEST MODEL ON TEST DATA ###
+
+#logistic regression
+log_fit1 <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~ speechrate + IQR + proportionSpoken, data = train_baked)
+
+
+
+#predict class and probability at the same time
+test_results1 <- 
+  test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit1, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit1, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1)
+   
+  )
+
+test_results1 %>% 
+  head(5) %>% 
+  knitr::kable() #examine the first 5
+
+#performance metrics
+metrics(test_results1, truth = Diagnosis, estimate = log_class) %>% 
+  knitr::kable() #kappa is how much the model predicts when you take out the chance (0.5)
+
+#plotting the roc curve:
+test_results1 %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot() #a perfect plot would go all the way up in the very beginning and then go horisontally
+
+#gain curve
+test_results1 %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot() #the bottom of the grey area is what the line would look like if it only predicted by chance
+             #the top of the grey area is what the curve would look like if the model predicted all the values correctly
 
 
 ```
+
 
